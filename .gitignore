@@ -1,0 +1,18 @@
+# build output
+*.exe
+*.pdb
+*.obj
+
+# OEM binaries: copied locally by setup-lib.ps1, never committed (not ours to redistribute)
+lib/*.dll
+
+# diagnostic output (contains hardware dumps)
+probe/probe_out.txt
+probe/diag_report.txt
+
+# editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
