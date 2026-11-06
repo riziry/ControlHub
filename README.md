@@ -206,7 +206,7 @@ Per-feature status on the reference machine:
 There is no installer: ControlHub is a single exe next to a `lib` folder.
 
 ```powershell
-git clone <this repo> ControlHub
+git clone https://github.com/riziry/ControlHub.git
 cd ControlHub
 
 # 1. copy the vendor DLLs into .\lib (they are not shipped in this repo)
