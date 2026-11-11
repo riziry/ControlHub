@@ -336,6 +336,7 @@ namespace ControlHub
 
         static void Loop()
         {
+            Perf.Mark("kbfx");
             uint lastV = uint.MaxValue, lastC = uint.MaxValue;
             bool active = false, dark = false;
             while (true)

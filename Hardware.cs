@@ -48,7 +48,9 @@ namespace ControlHub
         public static byte[] Buffer(int cmd)
         {
             var b = new byte[256];
+            long t0 = Perf.Now();
             if (Available) GetDCHU_Data_Buffer(cmd, ref b[0]);
+            Perf.Add("dchu.buffer" + cmd, t0);
             return b;
         }
 
@@ -62,7 +64,9 @@ namespace ControlHub
         public static byte[] ReadApp(int id, int len)
         {
             var b = new byte[Math.Max(1, len)];
+            long t0 = Perf.Now();
             if (Available) ReadAppSettings(id / 256, id % 256, len, ref b[0]);
+            Perf.Add("dchu.readapp", t0);
             return b;
         }
 
@@ -91,7 +95,9 @@ namespace ControlHub
             var b = BitConverter.GetBytes(value);
             b[3] = (byte)sub;
             if (!Available || DryRun) return;
+            long t0 = Perf.Now();
             lock (WriteGate) SetDCHU_Data(cmd, b, b.Length);
+            Perf.Add("dchu.write", t0);
         }
 
         // Package query that only reads (e.g. cmd 4 sub 40 = fan table): not logged as a write, runs in dry-run.
@@ -114,6 +120,82 @@ namespace ControlHub
             if (!Available || DryRun) return outb;
             lock (WriteGate) SetDCHU_DataEx(cmd, buf, 256, ref outb[0]);
             return outb;
+        }
+    }
+
+    // Cheap self-measurement for `--ipc perf`: CPU time per named thread and time spent per call type.
+    static class Perf
+    {
+        [DllImport("kernel32.dll")] static extern int GetCurrentThreadId();
+        [DllImport("kernel32.dll")] static extern bool QueryThreadCycleTime(IntPtr h, out ulong cycles);
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+        [DllImport("kernel32.dll")] static extern IntPtr OpenThread(int access, bool inherit, int id);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")] static extern bool GetThreadTimes(IntPtr h, out long c, out long e, out long k, out long u);
+        static readonly Dictionary<string, int> threads = new Dictionary<string, int>();
+        class Stat { public long N, Ticks; }
+        static readonly Dictionary<string, Stat> stats = new Dictionary<string, Stat>();
+        static readonly Dictionary<string, long> lastCpu = new Dictionary<string, long>();
+        static readonly Stopwatch since = Stopwatch.StartNew();
+
+        public static void Mark(string name) { lock (threads) threads[name] = GetCurrentThreadId(); }
+
+        // Stutter detector (`--ipc perf hitch`): watches the UI frame clock and records gaps > 40 ms.
+        static bool hitchOn; static TimeSpan lastFrame; static int hitches; static double worst;
+        static readonly List<string> hitchLog = new List<string>();
+        public static string Hitch(bool on)
+        {
+            if (on && !hitchOn) { hitchOn = true; lastFrame = TimeSpan.Zero; hitches = 0; worst = 0; hitchLog.Clear(); System.Windows.Media.CompositionTarget.Rendering += OnRender; return "hitch monitor on"; }
+            if (!on && hitchOn) { hitchOn = false; System.Windows.Media.CompositionTarget.Rendering -= OnRender; }
+            return string.Format(System.Globalization.CultureInfo.InvariantCulture, "hitches>40ms: {0}, worst {1:0} ms\n{2}", hitches, worst, string.Join("\n", hitchLog.ToArray()));
+        }
+        static void OnRender(object s, EventArgs e)
+        {
+            var t = ((System.Windows.Media.RenderingEventArgs)e).RenderingTime;
+            if (t == lastFrame) return;
+            if (lastFrame != TimeSpan.Zero)
+            {
+                double gap = (t - lastFrame).TotalMilliseconds;
+                if (gap > 40) { hitches++; worst = Math.Max(worst, gap); if (hitchLog.Count < 30) hitchLog.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "  " + gap.ToString("0") + " ms  (nvml last " + Nvml.LastMs.ToString("0") + " ms at " + Nvml.LastAt.ToString("HH:mm:ss.fff") + ")"); }
+            }
+            lastFrame = t;
+        }
+        public static long Now() { return Stopwatch.GetTimestamp(); }
+        public static void Add(string what, long t0)
+        {
+            long d = Stopwatch.GetTimestamp() - t0;
+            lock (stats) { Stat s; if (!stats.TryGetValue(what, out s)) { s = new Stat(); stats[what] = s; } s.N++; s.Ticks += d; }
+        }
+
+        // Everything since the previous report: per-thread CPU ms/s and per-call totals.
+        public static string Report()
+        {
+            var sb = new System.Text.StringBuilder();
+            double secs = since.Elapsed.TotalSeconds; since.Restart();
+            sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "window {0:0.0}s\n", secs);
+            var p = Process.GetCurrentProcess();
+            lock (threads)
+                foreach (var kv in threads)
+                {
+                    IntPtr h = OpenThread(0x0800, false, kv.Value);   // THREAD_QUERY_LIMITED_INFORMATION
+                    if (h == IntPtr.Zero) continue;
+                    long c, e, k, u; GetThreadTimes(h, out c, out e, out k, out u); CloseHandle(h);
+                    long cpu = k + u, prev; lastCpu.TryGetValue(kv.Key, out prev); lastCpu[kv.Key] = cpu;
+                    sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "thread {0,-8} id {1,-6} {2,6:0.0} ms/s\n", kv.Key, kv.Value, (cpu - prev) / 1e4 / secs);
+                }
+            long all = 0, ap; foreach (ProcessThread t in p.Threads) { try { all += t.TotalProcessorTime.Ticks; } catch { } }
+            lastCpu.TryGetValue("*", out ap); lastCpu["*"] = all;
+            sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "process total      {0,6:0.0} ms/s\n", (all - ap) / 1e4 / secs);
+            sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "memory ws {0:0} MB, private {1:0} MB, managed heap {2:0.0} MB, gen2 GCs {3}\n",
+                p.WorkingSet64 / 1048576.0, p.PrivateMemorySize64 / 1048576.0, GC.GetTotalMemory(false) / 1048576.0, GC.CollectionCount(2));
+            lock (stats)
+            {
+                foreach (var kv in stats)
+                    sb.AppendFormat(System.Globalization.CultureInfo.InvariantCulture, "call {0,-14} {1,5:0.0}/s  avg {2,6:0.00} ms  = {3,6:0.0} ms/s\n", kv.Key, kv.Value.N / secs,
+                        kv.Value.N > 0 ? kv.Value.Ticks * 1000.0 / Stopwatch.Frequency / kv.Value.N : 0, kv.Value.Ticks * 1000.0 / Stopwatch.Frequency / secs);
+                stats.Clear();
+            }
+            return sb.ToString();
         }
     }
 
@@ -156,6 +238,10 @@ namespace ControlHub
         public int Mode = -1;
         public double CpuLoad, RamUsed, RamTotal;
         public double CpuWatts = -1;     // RAPL package power (Windows "Energy Meter")
+        public double CpuMhz = -1;       // effective clock (Task Manager's "Speed")
+        public int GpuMhz = -1; public double GpuLoad = -1, GpuWatts = -1;   // dGPU via NVML, only while awake
+        // The EC reports a fixed 20 °C while the discrete GPU is powered down (any fan setting).
+        public bool GpuAsleep { get { return GpuTemp <= 21 || (Fans[1].Rpm == 0 && GpuTemp <= 25); } }
         public int Battery = -1; public bool OnAc = true, Charging;
         public bool Ok;
     }
@@ -191,7 +277,8 @@ namespace ControlHub
         public static KbState Kb = new KbState();
         public static byte[] Caps = new byte[256], Page7 = new byte[256];
 
-        static PerformanceCounter cpu, rapl;
+        static PerformanceCounter cpu, rapl, perf, freq;
+        static DateTime lastSensors;
         static int lastMode = -1;
 
         public static void Start()
@@ -215,10 +302,13 @@ namespace ControlHub
 
         static void Loop()
         {
+            Perf.Mark("hw");
             Dchu.Init();
             try { rapl = new PerformanceCounter("Energy Meter", "Power", "RAPL_Package0_PKG"); rapl.NextValue(); } catch { rapl = null; }
             try { cpu = new PerformanceCounter("Processor Information", "% Processor Utility", "_Total"); cpu.NextValue(); }
             catch { try { cpu = new PerformanceCounter("Processor", "% Processor Time", "_Total"); cpu.NextValue(); } catch { cpu = null; } }
+            try { perf = new PerformanceCounter("Processor Information", "% Processor Performance", "_Total"); perf.NextValue(); freq = new PerformanceCounter("Processor Information", "Processor Frequency", "_Total"); }
+            catch { perf = freq = null; }
             try
             {
                 Caps = Dchu.Buffer(13);
@@ -254,8 +344,19 @@ namespace ControlHub
         static void Poll()
         {
             var s = new Snapshot { Time = DateTime.Now };
+            // Buffer(12) is ~90 ms of kernel time (the EC is read through ACPI) — irreducible per call.
+            // In the tray, read it every 15 s; mode/battery/RAM (cheap) still update every poll. A
+            // temperature-driven keyboard effect needs live temperatures, so it keeps the normal rate.
+            bool sensors = !Background || !Last.Ok || KbFx.Current == KbFx.Kind.Temperature || (s.Time - lastSensors).TotalSeconds >= 14.5;
+            if (Dchu.Available && !sensors)
+            {
+                s.CpuTemp = Last.CpuTemp; s.GpuTemp = Last.GpuTemp; s.Fans = Last.Fans; s.FanCount = Last.FanCount; s.Ok = true;
+                s.Mode = Dchu.ReadApp(257, 1)[0];
+                goto system;
+            }
             if (Dchu.Available)
             {
+                lastSensors = s.Time;
                 var b = Dchu.Buffer(12);
                 // an LED write from the effect thread at the same moment can make the OEM DLL return an
                 // empty buffer; a 0 °C CPU is impossible, so retry once and otherwise keep the last values
@@ -281,7 +382,10 @@ namespace ControlHub
         system:
             try { if (cpu != null) s.CpuLoad = Math.Min(100, cpu.NextValue()); } catch { }
             try { if (rapl != null) s.CpuWatts = rapl.NextValue() / 1000.0; } catch { s.CpuWatts = -1; }
-            if (s.Ok) ModeStats.Add(s);
+            try { if (perf != null) s.CpuMhz = freq.NextValue() * perf.NextValue() / 100.0; } catch { s.CpuMhz = -1; }
+            // dGPU details only while someone is looking and the GPU is already awake (never wake it)
+            if (s.Ok && !Background && !s.GpuAsleep) Nvml.Read(s);
+            if (s.Ok && sensors) ModeStats.Add(s);   // only fresh readings count
             var m = new Win.MEMSTATUS(); m.dwLength = (uint)Marshal.SizeOf(m);
             if (Win.GlobalMemoryStatusEx(ref m)) { s.RamTotal = m.ullTotalPhys; s.RamUsed = m.ullTotalPhys - m.ullAvailPhys; }
             Win.SYSTEM_POWER_STATUS ps;
@@ -873,6 +977,50 @@ namespace ControlHub
                     Settings.Set("stats" + kv.Key, string.Format(K.EN, "{0};{1:0.0};{2:0.0};{3:0};{4:0};{5:0}", kv.Value.N, kv.Value.SumW, kv.Value.PeakW, kv.Value.PeakT, kv.Value.PeakRpm, kv.Value.SumT));
         }
         public static S Get(int mode) { S s; lock (map) return map.TryGetValue(Norm(mode), out s) ? s : null; }
+    }
+
+    // NVIDIA NVML (ships with the driver): clock, load and board power of the discrete GPU.
+    // Called only while the EC already reports the dGPU awake, and the library is shut down after
+    // every read so ControlHub never holds the GPU open (it must stay free to power down).
+    static class Nvml
+    {
+        [StructLayout(LayoutKind.Sequential)] struct Util { public uint Gpu, Mem; }
+        [DllImport("nvml.dll")] static extern int nvmlInit_v2();
+        [DllImport("nvml.dll")] static extern int nvmlShutdown();
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetHandleByIndex_v2(uint i, out IntPtr dev);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetClockInfo(IntPtr dev, int type, out uint mhz);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetUtilizationRates(IntPtr dev, out Util u);
+        [DllImport("nvml.dll")] static extern int nvmlDeviceGetPowerUsage(IntPtr dev, out uint mw);
+        static bool broken;
+        public static double LastMs; public static DateTime LastAt;
+
+        public static void Read(Snapshot s)
+        {
+            if (broken) return;
+            var sw = Stopwatch.StartNew(); long t0 = Perf.Now(); LastAt = DateTime.Now;
+            try { ReadCore(s); } finally { LastMs = sw.Elapsed.TotalMilliseconds; Perf.Add("nvml", t0); }
+        }
+
+        static void ReadCore(Snapshot s)
+        {
+            try
+            {
+                if (nvmlInit_v2() != 0) { broken = true; Log.Write("nvml: init failed"); return; }
+                try
+                {
+                    IntPtr d;
+                    if (nvmlDeviceGetHandleByIndex_v2(0, out d) != 0) return;
+                    uint v; Util u;
+                    if (nvmlDeviceGetClockInfo(d, 0, out v) == 0) s.GpuMhz = (int)v;         // graphics clock
+                    if (nvmlDeviceGetUtilizationRates(d, out u) == 0) s.GpuLoad = u.Gpu;
+                    if (nvmlDeviceGetPowerUsage(d, out v) == 0) s.GpuWatts = v / 1000.0;
+                }
+                finally { nvmlShutdown(); }
+            }
+            catch (DllNotFoundException) { broken = true; }
+            catch (EntryPointNotFoundException) { broken = true; }
+            catch (Exception ex) { Log.Write("nvml: " + ex.Message); }
+        }
     }
 
     static class Win

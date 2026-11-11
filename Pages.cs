@@ -62,24 +62,30 @@ namespace ControlHub
         }
         public static void Put(Grid g, UIElement e, int col) { Grid.SetColumn(e, col * 2); g.Children.Add(e); }
 
-        // Thin bar whose fill glides to its value.
+        // Thin bar whose fill glides to its value. The fill lives in a Canvas, so animating its width
+        // never re-measures the page (a Grid parent passed every frame's size change up the tree), and
+        // the glide is capped at 60 fps: these bars update every second on the live pages.
         public class Bar : Grid
         {
-            readonly Border fill; double v;
+            readonly Border fill; readonly Canvas host = new Canvas { ClipToBounds = true }; double v;
             public Bar(double h, Brush fg)
             {
                 Height = h;
                 Children.Add(new Border { CornerRadius = new CornerRadius(h / 2), Background = Theme.Raised });
-                fill = new Border { CornerRadius = new CornerRadius(h / 2), Background = fg, HorizontalAlignment = HorizontalAlignment.Left, Width = 0 };
-                Children.Add(fill);
-                SizeChanged += delegate { fill.BeginAnimation(WidthProperty, null); fill.Width = v <= 0 ? 0 : Math.Max(h, ActualWidth * v); };
+                fill = new Border { CornerRadius = new CornerRadius(h / 2), Background = fg, Height = h, Width = 0 };
+                host.Children.Add(fill);
+                Children.Add(host);
+                SizeChanged += delegate { fill.BeginAnimation(WidthProperty, null); fill.Width = Target(); };
             }
+            double Target() { return v <= 0 ? 0 : Math.Max(Height, ActualWidth * v); }
             public void SetFill(Brush b) { fill.Background = b; }
             public void Set(double t)
             {
                 v = Math.Max(0, Math.Min(1, t));
                 if (ActualWidth <= 0) return;
-                fill.BeginAnimation(WidthProperty, K.Anim(v <= 0 ? 0 : Math.Max(Height, ActualWidth * v), 700, K.OutCubic));
+                double to = Target();
+                if (Math.Abs(to - fill.ActualWidth) < 1 && fill.HasAnimatedProperties == false) { fill.Width = to; return; }
+                fill.BeginAnimation(WidthProperty, K.Anim(to, 700, K.OutCubic));
             }
         }
 
@@ -110,7 +116,7 @@ namespace ControlHub
         public static Border Divider() { return new Border { Height = 1, Background = Theme.Hairline, Margin = new Thickness(0, 16, 0, 16) }; }
 
         // The EC reports a fixed 20° while the discrete GPU is powered down.
-        public static bool GpuAsleep(Snapshot s) { return s.Fans[1].Rpm == 0 && s.GpuTemp <= 25; }
+        public static bool GpuAsleep(Snapshot s) { return s.GpuAsleep; }
     }
 
     // ===================================================================== Overview
@@ -124,9 +130,10 @@ namespace ControlHub
         // banner
         readonly Border healthIcon; readonly TextBlock healthGlyph, healthTitle, healthSub;
         // gauges + mode
-        readonly Gauge cpuG = new Gauge(176, 13), gpuG = new Gauge(176, 13);
+        readonly Gauge cpuG = new Gauge(164, 12), gpuG = new Gauge(164, 12);
         readonly SpringNumber cpuT, gpuT;
         readonly TextBlock cpuSub, gpuSub, modeName, modeDesc;
+        readonly TextBlock[] cpuStat = new TextBlock[3], gpuStat = new TextBlock[3];   // clock, load, power
         readonly Border modeIcon; readonly TextBlock modeGlyph;
         readonly Segmented modeSeg;
         // fans
@@ -171,12 +178,12 @@ namespace ControlHub
 
             // ---- 1. CPU, GPU, mode
             var r1 = UI.Columns(1, 1, 1.6);
-            r1.Height = 300; r1.Margin = new Thickness(0, 18, 0, 0);
-            cpuT = new SpringNumber(44, Theme.Text, FontWeights.Bold, "0", "°"); cpuT.FontFamily = K.Display;
-            gpuT = new SpringNumber(44, Theme.Text, FontWeights.Bold, "0", "°"); gpuT.FontFamily = K.Display;
-            cpuSub = K.TB("", 12.5, Theme.Text3, FontWeights.Medium); gpuSub = K.TB("", 12.5, Theme.Text3, FontWeights.Medium);
-            UI.Put(r1, GaugeCard("", "Processor", cpuG, cpuT, cpuSub), 0);
-            UI.Put(r1, GaugeCard("", "Graphics", gpuG, gpuT, gpuSub), 1);
+            r1.Height = 340; r1.Margin = new Thickness(0, 18, 0, 0);
+            cpuT = new SpringNumber(40, Theme.Text, FontWeights.Bold, "0", "°"); cpuT.FontFamily = K.Display;
+            gpuT = new SpringNumber(40, Theme.Text, FontWeights.Bold, "0", "°"); gpuT.FontFamily = K.Display;
+            cpuSub = K.TB("", 12, Theme.Text3, FontWeights.SemiBold); gpuSub = K.TB("", 12, Theme.Text3, FontWeights.SemiBold);
+            UI.Put(r1, GaugeCard("", "Processor", cpuG, cpuT, cpuSub, cpuStat), 0);
+            UI.Put(r1, GaugeCard("", "Graphics", gpuG, gpuT, gpuSub, gpuStat), 1);
 
             var mc = new Grid();
             mc.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -272,27 +279,48 @@ namespace ControlHub
             return card;
         }
 
-        Border GaugeCard(string glyph, string name, Gauge g, SpringNumber num, TextBlock sub)
+        // Gauge with only the temperature (and one short word) inside the ring; clock / load / power
+        // sit in a strip underneath so nothing overlaps the arc.
+        Border GaugeCard(string glyph, string name, Gauge g, SpringNumber num, TextBlock sub, TextBlock[] stat)
         {
             var grid = new Grid();
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             grid.RowDefinitions.Add(new RowDefinition());
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             grid.Children.Add(UI.Header(glyph, name, null));
-            var host = new Grid { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 10, 0, 0) };
+            var host = new Grid { Width = g.Width, Height = g.Height, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 0, 0) };
             host.Children.Add(g);
-            var center = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 6, 0, 0) };
+            var center = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 4, 0, 0) };
             num.HorizontalAlignment = HorizontalAlignment.Center;
             center.Children.Add(num);
-            sub.HorizontalAlignment = HorizontalAlignment.Center;
+            sub.HorizontalAlignment = HorizontalAlignment.Center; sub.MaxWidth = g.Width * 0.62; sub.Margin = new Thickness(0, -2, 0, 0);
             center.Children.Add(sub);
             host.Children.Add(center);
-            // scale ends of the 270° arc
-            var lo = K.TB("20°", 10.5, Theme.Text3, FontWeights.SemiBold); lo.HorizontalAlignment = HorizontalAlignment.Left; lo.VerticalAlignment = VerticalAlignment.Bottom; lo.Margin = new Thickness(26, 0, 0, 6);
-            var hi = K.TB("100°", 10.5, Theme.Text3, FontWeights.SemiBold); hi.HorizontalAlignment = HorizontalAlignment.Right; hi.VerticalAlignment = VerticalAlignment.Bottom; hi.Margin = new Thickness(0, 0, 20, 6);
+            // scale ends of the 270° arc, under the two arc tips
+            var lo = K.TB("20°", 10.5, Theme.Text3, FontWeights.SemiBold); lo.HorizontalAlignment = HorizontalAlignment.Left; lo.VerticalAlignment = VerticalAlignment.Bottom; lo.Margin = new Thickness(g.Width * 0.17, 0, 0, -2);
+            var hi = K.TB("100°", 10.5, Theme.Text3, FontWeights.SemiBold); hi.HorizontalAlignment = HorizontalAlignment.Right; hi.VerticalAlignment = VerticalAlignment.Bottom; hi.Margin = new Thickness(0, 0, g.Width * 0.13, -2);
             host.Children.Add(lo); host.Children.Add(hi);
             Grid.SetRow(host, 1); grid.Children.Add(host);
-            return K.Card(grid, new Thickness(22));
+
+            var strip = new Grid { Margin = new Thickness(0, 12, 0, 0) };
+            string[] labels = { "MHz", "Load", "Power" };
+            for (int i = 0; i < 3; i++)
+            {
+                strip.ColumnDefinitions.Add(new ColumnDefinition());
+                var sp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center };
+                stat[i] = K.TB("–", 14, Theme.Text, FontWeights.SemiBold); stat[i].HorizontalAlignment = HorizontalAlignment.Center; K.Tabular(stat[i]);
+                var l = K.TB(labels[i], 11, Theme.Text3, FontWeights.Medium); l.HorizontalAlignment = HorizontalAlignment.Center; l.Margin = new Thickness(0, 1, 0, 0);
+                sp.Children.Add(stat[i]); sp.Children.Add(l);
+                Grid.SetColumn(sp, i); strip.Children.Add(sp);
+                if (i > 0) { var d = new Border { Width = 1, Background = Theme.Hairline, HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 4, 0, 4) }; Grid.SetColumn(d, i); strip.Children.Add(d); }
+            }
+            var sb = new Border { CornerRadius = new CornerRadius(14), Background = Theme.Raised, Padding = new Thickness(4, 9, 4, 9), Child = strip, Margin = new Thickness(0, 12, 0, 0) };
+            Grid.SetRow(sb, 2); grid.Children.Add(sb);
+            return K.Card(grid, new Thickness(20));
         }
+
+        static string Mhz(double v) { return v > 0 ? v.ToString("#,0", K.EN) : "–"; }
+        static string TempWord(int t) { return t < 60 ? "Cool" : t < 75 ? "Warm" : t < 88 ? "Hot" : "Very hot"; }
 
         Border FanCard(int i, string name)
         {
@@ -427,11 +455,26 @@ namespace ControlHub
             cpuT.Set(s.CpuTemp);
             cpuG.SetValue01((s.CpuTemp - 20) / 80.0);
             cpuG.SetColor(Theme.TempColor(s.CpuTemp));
-            cpuSub.Text = s.CpuWatts >= 0 ? string.Format(K.EN, "Load {0:0}% · {1:0.0} W", s.CpuLoad, s.CpuWatts) : string.Format(K.EN, "Load {0:0}%", s.CpuLoad);
+            cpuSub.Text = TempWord(s.CpuTemp);
+            cpuStat[0].Text = Mhz(s.CpuMhz);
+            cpuStat[1].Text = s.CpuLoad.ToString("0", K.EN) + "%";
+            cpuStat[2].Text = s.CpuWatts >= 0 ? s.CpuWatts.ToString("0.0", K.EN) + " W" : "–";
             bool gpuIdle = UI.GpuAsleep(s);
-            if (gpuIdle) { gpuT.SetText("Asleep"); gpuG.SetValue01(0); gpuSub.Text = "Discrete GPU powered off"; }
-            else { gpuT.Set(s.GpuTemp); gpuG.SetValue01((s.GpuTemp - 20) / 80.0); gpuG.SetColor(Theme.TempColor(s.GpuTemp)); gpuSub.Text = "Discrete GPU active"; }
+            if (gpuIdle)
+            {
+                gpuT.SetText("Off"); gpuG.SetValue01(0); gpuSub.Text = "Asleep";
+                gpuStat[0].Text = "–"; gpuStat[1].Text = "–"; gpuStat[2].Text = "0 W";
+            }
+            else
+            {
+                gpuT.Set(s.GpuTemp); gpuG.SetValue01((s.GpuTemp - 20) / 80.0); gpuG.SetColor(Theme.TempColor(s.GpuTemp)); gpuSub.Text = TempWord(s.GpuTemp);
+                gpuStat[0].Text = Mhz(s.GpuMhz);
+                gpuStat[1].Text = s.GpuLoad >= 0 ? s.GpuLoad.ToString("0", K.EN) + "%" : "–";
+                gpuStat[2].Text = s.GpuWatts >= 0 ? s.GpuWatts.ToString("0.0", K.EN) + " W" : "–";
+            }
             gpuT.Opacity = gpuIdle ? 0.55 : 1;
+            var gtip = s.GpuMhz > 0 ? "NVIDIA graphics clock, load and board power" : "Shown while the discrete GPU is awake";
+            ((FrameworkElement)gpuStat[0].Parent).ToolTip = gtip;
 
             tempNow[0].Text = s.CpuTemp + "°"; tempNow[1].Text = gpuIdle ? "asleep" : s.GpuTemp + "°";
             fanNow[0].Text = s.Fans[0].Rpm.ToString("#,0", K.EN); fanNow[1].Text = s.Fans[1].Rpm.ToString("#,0", K.EN);

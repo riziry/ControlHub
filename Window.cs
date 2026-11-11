@@ -129,7 +129,7 @@ namespace ControlHub
         int current = -1;
         public int PendingMode = -1; DateTime pendingAt;
 
-        public DashboardPage Dash; public PowerPage Power; public FansPage FanPage; public BatteryPage Batt; public KeyboardPage Keys; public PrefsPage Pref; public SettingsPage Prefs;
+        public DashboardPage Dash; public ActivityPage Activity; public PowerPage Power; public FansPage FanPage; public BatteryPage Batt; public KeyboardPage Keys; public PrefsPage Pref; public SettingsPage Prefs;
 
         public MainWindow()
         {
@@ -238,9 +238,10 @@ namespace ControlHub
 
             Content = root;
 
-            Dash = new DashboardPage(this); Power = new PowerPage(this); FanPage = new FansPage(this); Batt = new BatteryPage(this); Keys = new KeyboardPage(this); Pref = new PrefsPage(this); Prefs = new SettingsPage(this);
+            Dash = new DashboardPage(this); Activity = new ActivityPage(this); Power = new PowerPage(this); FanPage = new FansPage(this); Batt = new BatteryPage(this); Keys = new KeyboardPage(this); Pref = new PrefsPage(this); Prefs = new SettingsPage(this);
             AddPage(Dash, "", "Overview");
-            AddPage(Power, "", "Power Mode");
+            AddPage(Activity, "", "Activity");
+            AddPage(Power,"", "Power Mode");
             AddPage(FanPage, "", "Cooling");
             AddPage(Batt, "", "Battery");
             AddPage(Keys, "", "Keyboard");
@@ -250,7 +251,7 @@ namespace ControlHub
             // parts that copy theme colours (instead of using the shared brushes) repaint on a theme change
             Theme.Changed += delegate
             {
-                Action[] fixes = { Dash.ThemeChanged, Power.ThemeChanged, FanPage.ThemeChanged, Keys.ThemeChanged, Pref.ThemeChanged };
+                Action[] fixes = { Dash.ThemeChanged, Activity.ThemeChanged, Power.ThemeChanged, FanPage.ThemeChanged, Keys.ThemeChanged, Pref.ThemeChanged };
                 foreach (var a in fixes) { try { a(); } catch (Exception ex) { Log.Write("theme repaint: " + ex.Message); } }
                 try
                 {
@@ -390,7 +391,10 @@ namespace ControlHub
         public void Navigate(string name)
         {
             string n = name.ToLowerInvariant();
-            int i = n.StartsWith("dash") || n == "home" || n.StartsWith("over") ? 0 : n.StartsWith("pow") || n.StartsWith("mode") ? 1 : n.StartsWith("fan") || n.StartsWith("cool") ? 2 : n.StartsWith("bat") || n.StartsWith("charge") ? 3 : n.StartsWith("key") || n.StartsWith("kb") ? 4 : n.StartsWith("pref") ? 5 : n.StartsWith("set") ? 6 : -1;
+            IPage p = n.StartsWith("dash") || n == "home" || n.StartsWith("over") ? Dash : n.StartsWith("act") || n.StartsWith("proc") || n.StartsWith("task") ? (IPage)Activity
+                : n.StartsWith("pow") || n.StartsWith("mode") ? Power : n.StartsWith("fan") || n.StartsWith("cool") ? FanPage : n.StartsWith("bat") || n.StartsWith("charge") ? Batt
+                : n.StartsWith("key") || n.StartsWith("kb") ? Keys : n.StartsWith("pref") ? Pref : n.StartsWith("set") ? (IPage)Prefs : null;
+            int i = p != null ? pages.IndexOf(p) : -1;
             if (i < 0) int.TryParse(n, out i);
             Navigate(i, true);
         }

@@ -109,6 +109,7 @@ namespace ControlHub
                 t.Start();
             };
             StartIpcServer();
+            Perf.Mark("ui");
             if (!startHidden) Win.Show();
             app.Run();
             KbFx.RestoreOnExit();
@@ -257,6 +258,9 @@ namespace ControlHub
                 case "fan": return Win.FanPage.Ipc(arg);
                 case "charge": return Win.Batt.Ipc(arg);
                 case "pref": return Win.Pref.Ipc(arg);
+                case "top": return Win.Activity.Ipc(arg);
+                // perf | perf hitch (start, then again = report so far) | perf hitch off (stop + report)
+                case "perf": return arg == "hitch" ? Perf.Hitch(true) : arg == "hitch off" ? Perf.Hitch(false) : Perf.Report();
                 case "kb":
                     {
                         var a = arg.Split(' ');

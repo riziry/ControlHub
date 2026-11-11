@@ -760,6 +760,7 @@ namespace ControlHub
             speed.Target = rpm <= 0 ? 0 : 40 + rpm * 0.12;   // degrees per second
             if (!live && IsVisible && K.AnimScale > 0 && (speed.Target > 0 || speed.Value > 0.5)) { live = true; Frame.Add(Tick); }
         }
+        // Per-frame at the panel rate on purpose: a capped (30 fps) animation looked choppy at 165 Hz.
         bool Tick(double dt)
         {
             // never keep the render loop alive for an invisible rotor (hidden page / tray) or with motion off

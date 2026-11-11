@@ -109,6 +109,13 @@ namespace ControlHub
         readonly Border optionsCard;
         int choice = -1, selStart = -1, selStop = -1; bool busy;
         DateTime lastWmi; BatteryInfo info = new BatteryInfo();
+        // health / history (from Windows' battery report)
+        readonly TextBlock healthPct, healthSub, healthNote, useSub, histNote;
+        readonly Border healthChip; readonly UI.Bar healthBar;
+        readonly TimeChart healthChart, chargeChart;
+        readonly Grid useBars = new Grid();
+        readonly Segmented rangeSeg;
+        BattReport report;
 
         public string Title { get { return "Battery"; } }
         public string Subtitle { get { return "Live battery status and charge limit (FlexiCharger)"; } }
@@ -134,6 +141,60 @@ namespace ControlHub
             right.Children.Add(stats);
             Grid.SetColumn(right, 1); g.Children.Add(right);
             stack.Children.Add(K.Card(WithHeader("", "Status", g), new Thickness(22)));
+
+            // ---- health + daily use
+            var hr = UI.Columns(1, 1); hr.Margin = new Thickness(0, 18, 0, 0);
+            var hs = new StackPanel();
+            var hrow = new StackPanel { Orientation = Orientation.Horizontal };
+            healthPct = K.TB("–", 36, Theme.Text, FontWeights.Bold); healthPct.FontFamily = K.Display; K.Tabular(healthPct);
+            hrow.Children.Add(healthPct);
+            healthChip = UI.Chip("", Theme.GreenSoft, Theme.Green); healthChip.Margin = new Thickness(14, 6, 0, 0);
+            hrow.Children.Add(healthChip);
+            hs.Children.Add(hrow);
+            healthBar = new UI.Bar(8, Theme.Green); healthBar.Margin = new Thickness(0, 12, 0, 10);
+            hs.Children.Add(healthBar);
+            healthSub = K.TB("Reading Windows' battery records…", 12.5, Theme.Text2, FontWeights.Medium); healthSub.TextWrapping = TextWrapping.Wrap; healthSub.TextTrimming = TextTrimming.None;
+            hs.Children.Add(healthSub);
+            var tl = K.TB("Full-charge capacity per day", 12, Theme.Text3, FontWeights.SemiBold); tl.Margin = new Thickness(0, 18, 0, 4);
+            hs.Children.Add(tl);
+            healthChart = new TimeChart { Height = 120, AutoY = true, DayTicks = true, ShowDots = true, Fmt = v => v.ToString("0", K.EN) + "%" };
+            healthChart.LineColor = () => Theme.Current.Green;
+            hs.Children.Add(healthChart);
+            healthNote = K.TB("", 11.5, Theme.Text3, FontWeights.Medium); healthNote.Margin = new Thickness(0, 8, 0, 0); healthNote.TextWrapping = TextWrapping.Wrap; healthNote.TextTrimming = TextTrimming.None;
+            hs.Children.Add(healthNote);
+            UI.Put(hr, K.Card(WithHeader("", "Battery health", hs), new Thickness(22)), 0);
+
+            var us = new StackPanel();
+            useBars.Height = 196;
+            us.Children.Add(useBars);
+            useSub = K.TB("", 12.5, Theme.Text2, FontWeights.Medium); useSub.Margin = new Thickness(0, 14, 0, 0); useSub.TextWrapping = TextWrapping.Wrap; useSub.TextTrimming = TextTrimming.None;
+            us.Children.Add(useSub);
+            UI.Put(hr, K.Card(WithHeader("", "Time on battery per day", us), new Thickness(22)), 1);
+            stack.Children.Add(hr);
+
+            // ---- charge history
+            var cs = new StackPanel();
+            var ctop = new Grid();
+            ctop.ColumnDefinitions.Add(new ColumnDefinition()); ctop.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            ctop.Children.Add(UI.Header("", "Charge history", null));
+            rangeSeg = new Segmented(new[] { "24 hours", "3 days", "7 days" }, 0, 34) { Width = 270 };
+            rangeSeg.SetLabelSize(12);
+            rangeSeg.Changed += i => ApplyChart();
+            Grid.SetColumn(rangeSeg, 1); ctop.Children.Add(rangeSeg);
+            cs.Children.Add(ctop);
+            chargeChart = new TimeChart { Height = 230, Margin = new Thickness(0, 16, 0, 0), BandName = "On charger", GapName = "Asleep" };
+            var cc = chargeChart;
+            chargeChart.Describe = t => InRange(t, cc.Gaps) ? "Asleep" : InRange(t, cc.Bands) ? "On charger" : "On battery";
+            cs.Children.Add(chargeChart);
+            var leg = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(38, 10, 0, 0) };
+            leg.Children.Add(Legend(Theme.A(Theme.Current.Green, 0.35), "On charger"));
+            leg.Children.Add(Legend(Theme.A(Theme.Current.Text, 0.14), "Asleep"));
+            cs.Children.Add(leg);
+            histNote = K.TB("", 12, Theme.Text3, FontWeights.Medium); histNote.Margin = new Thickness(38, 8, 0, 0);
+            histNote.TextWrapping = TextWrapping.Wrap; histNote.TextTrimming = TextTrimming.None;
+            cs.Children.Add(histNote);
+            var ccard = K.Card(cs, new Thickness(22)); ccard.Margin = new Thickness(0, 18, 0, 0);
+            stack.Children.Add(ccard);
 
             // ---- charge limit
             var oc = new StackPanel();
@@ -162,6 +223,7 @@ namespace ControlHub
             stack.Children.Add(unsupported);
 
             Hw.ChargeChanged += c => w.Dispatcher.BeginInvoke(new Action(() => OnCharge(c)));
+            Hw.Updated += BattLog.Observe;
         }
 
         static StackPanel WithHeader(string glyph, string title, FrameworkElement body)
@@ -327,9 +389,119 @@ namespace ControlHub
                 System.Threading.ThreadPool.QueueUserWorkItem(_ => { var b = BatteryInfo.Read(); w.Dispatcher.BeginInvoke(new Action(() => { info = b; UpdateStatus(Hw.Last); })); });
             }
             UpdateStatus(s);
+            // keep the history current while the page is open (the report itself is cached for 5 min)
+            if (report != null && (DateTime.Now - report.When).TotalSeconds >= 300) LoadReport();
+            else if (report != null && s.Battery >= 0 && s.Time.Second % 30 == 0) ApplyChart();
         }
 
-        public void OnShown() { lastWmi = DateTime.MinValue; Hw.RefreshCharge(); Update(Hw.Last); }
+        public void OnShown() { lastWmi = DateTime.MinValue; Hw.RefreshCharge(); Update(Hw.Last); LoadReport(); }
+
+        // ---------------------------------------------------------------- health + history
+        void LoadReport() { BattReport.Load(300, r => w.Dispatcher.BeginInvoke(new Action(() => ApplyReport(r)))); }
+
+        static bool InRange(DateTime t, List<TimeSpanRange> l) { foreach (var r in l) if (t >= r.A && t <= r.B) return true; return false; }
+
+        static StackPanel Legend(Color c, string text)
+        {
+            var sp = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 16, 0) };
+            sp.Children.Add(new Border { Width = 12, Height = 12, CornerRadius = new CornerRadius(3), Background = K.Solid(c), Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center });
+            sp.Children.Add(K.TB(text, 12, Theme.Text3, FontWeights.Medium));
+            return sp;
+        }
+
+        static string Hm(TimeSpan t) { return t.TotalMinutes < 1 ? "0m" : t.TotalHours < 1 ? string.Format("{0}m", t.Minutes) : string.Format("{0}h {1:00}m", (int)t.TotalHours, t.Minutes); }
+
+        void ApplyReport(BattReport r)
+        {
+            report = r;
+            if (r == null || !r.Ok)
+            {
+                healthSub.Text = "Windows' battery report isn't available" + (r != null && r.Error.Length > 0 ? " (" + r.Error + ")" : "") + ".";
+                return;
+            }
+            // health
+            double hp = r.HealthPct;
+            if (hp > 0)
+            {
+                healthPct.Text = hp.ToString("0.0", K.EN) + "%";
+                string word; Brush fg, bg;
+                if (hp >= 80) { word = "Good"; fg = Theme.Green; bg = Theme.GreenSoft; }
+                else if (hp >= 60) { word = "Worn"; fg = Theme.Orange; bg = Theme.OrangeSoft; }
+                else { word = "Replace soon"; fg = Theme.Red; bg = Theme.RedSoft; }
+                ((TextBlock)healthChip.Child).Text = word; ((TextBlock)healthChip.Child).Foreground = fg; healthChip.Background = bg;
+                healthBar.SetFill(fg); healthBar.Set(hp / 100);
+                healthSub.Text = string.Format(K.EN, "Holds {0:0.0} Wh when full, {1:0.0} Wh when new · {2:0.0}% wear", r.FullWh, r.DesignWh, 100 - hp);
+            }
+            else { healthPct.Text = "–"; healthSub.Text = "The battery doesn't report its design capacity."; }
+            healthNote.Text = (r.Cycles > 0 ? "Charge cycles: " + r.Cycles + ". " : "Charge cycles: not reported by this battery. ")
+                + "The battery re-estimates its capacity as it charges and drains, so single days can jump.";
+            var hpts = new List<TimePoint>();
+            foreach (var d in r.Days) if (d.DesignWh > 0 && d.FullWh > 0) hpts.Add(new TimePoint(d.Day.AddHours(12), Math.Min(100, d.FullWh / d.DesignWh * 100)));
+            if (hp > 0) hpts.Add(new TimePoint(DateTime.Now, hp));
+            healthChart.Points = hpts;
+            if (hpts.Count > 0)
+            {
+                healthChart.X0 = hpts[0].T.Date; healthChart.X1 = DateTime.Now.Date.AddDays(1);
+                if ((healthChart.X1 - healthChart.X0).TotalDays < 3) healthChart.X0 = healthChart.X1.AddDays(-3);
+            }
+            healthChart.InvalidateVisual();
+
+            // time on battery per day (last 7 days with records)
+            useBars.Children.Clear(); useBars.ColumnDefinitions.Clear();
+            var days = r.Days.GetRange(Math.Max(0, r.Days.Count - 7), Math.Min(7, r.Days.Count));
+            double maxH = 1; foreach (var d in days) maxH = Math.Max(maxH, (d.OnBattery + d.OnCharger).TotalHours);
+            double sum = 0;
+            for (int i = 0; i < days.Count; i++)
+            {
+                var d = days[i];
+                sum += d.OnBattery.TotalHours;
+                useBars.ColumnDefinitions.Add(new ColumnDefinition());
+                var col = new Grid { Margin = new Thickness(5, 0, 5, 0) };
+                col.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                col.RowDefinitions.Add(new RowDefinition());
+                col.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                var v = K.TB(d.OnBattery.TotalHours >= 0.05 ? d.OnBattery.TotalHours.ToString("0.0", K.EN) + "h" : "0h", 12, Theme.Text, FontWeights.SemiBold); v.HorizontalAlignment = HorizontalAlignment.Center;
+                col.Children.Add(v);
+                // stacked: battery (accent) on top of charger (green, faint)
+                var stackBar = new StackPanel { VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 6, 0, 6), MaxWidth = 34 };
+                double full = 130;
+                var batt = new Border { Height = Math.Max(d.OnBattery.TotalMinutes > 0 ? 3 : 0, full * d.OnBattery.TotalHours / maxH), Background = Theme.AccentFill, CornerRadius = new CornerRadius(6, 6, d.OnCharger.TotalMinutes > 1 ? 0 : 6, d.OnCharger.TotalMinutes > 1 ? 0 : 6) };
+                var ac = new Border { Height = full * d.OnCharger.TotalHours / maxH, Background = K.Solid(Theme.A(Theme.Current.Green, 0.30)), CornerRadius = new CornerRadius(d.OnBattery.TotalMinutes > 1 ? 0 : 6, d.OnBattery.TotalMinutes > 1 ? 0 : 6, 6, 6) };
+                stackBar.Children.Add(batt); stackBar.Children.Add(ac);
+                Grid.SetRow(stackBar, 1); col.Children.Add(stackBar);
+                var lbl = K.TB(d.Day.ToString("ddd", K.EN), 11.5, Theme.Text3, FontWeights.SemiBold); lbl.HorizontalAlignment = HorizontalAlignment.Center;
+                Grid.SetRow(lbl, 2); col.Children.Add(lbl);
+                col.Background = Brushes.Transparent;
+                col.ToolTip = d.Day.ToString("dddd d MMMM", K.EN) + "\nOn battery " + Hm(d.OnBattery) + (d.BatteryWh > 0 ? string.Format(K.EN, " · used {0:0.0} Wh", d.BatteryWh) : "")
+                    + "\nOn charger " + Hm(d.OnCharger) + (d.OnBattery.TotalHours > 0.2 && d.BatteryWh > 0 ? string.Format(K.EN, "\nAverage drain {0:0.0} W", d.BatteryWh / d.OnBattery.TotalHours) : "");
+                Grid.SetColumn(col, i); useBars.Children.Add(col);
+            }
+            useSub.Text = days.Count == 0 ? "No daily records yet." : string.Format(K.EN, "Average {0} on battery per day. Blue = on battery, green = on the charger (screen on). Hover a day for details.", Hm(TimeSpan.FromHours(sum / days.Count)));
+
+            ApplyChart();
+        }
+
+        void ApplyChart()
+        {
+            var r = report;
+            if (r == null || !r.Ok) return;
+            int[] hours = { 24, 72, 168 };
+            int sel = Math.Max(0, rangeSeg.Selected);
+            var now = DateTime.Now;
+            chargeChart.X1 = now; chargeChart.X0 = now.AddHours(-hours[sel]);
+            chargeChart.DayTicks = sel == 2;
+            var pts = BattLog.Merge(r.Level, BattLog.Read());
+            if (Hw.Last.Battery >= 0) pts.Add(new TimePoint(now, Hw.Last.Battery));
+            chargeChart.Points = pts;
+            chargeChart.Bands = r.Ac;
+            // the open charger period runs until now
+            if (Hw.Last.OnAc && r.Ac.Count > 0) { var last = r.Ac[r.Ac.Count - 1]; if (last.B < now && (now - last.B).TotalMinutes < 30) chargeChart.Bands = new List<TimeSpanRange>(r.Ac) { new TimeSpanRange(last.B, now) }; }
+            chargeChart.Gaps = r.Sleep;
+            chargeChart.InvalidateVisual();
+            DateTime first = r.Level.Count > 0 ? r.Level[0].T : now;
+            histNote.Text = (first > chargeChart.X0 ? "Records start " + first.ToString("ddd d MMM HH:mm", K.EN) + ". " : "")
+                + "Windows logs the level when the power state changes; ControlHub adds a point every minute while it runs.";
+        }
 
         public string Ipc(string arg)
         {
